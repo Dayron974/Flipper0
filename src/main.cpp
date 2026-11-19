@@ -43,7 +43,16 @@ const uint8_t NB_PROFILS = 3;
 #define MAX_FRONTS       2048
 #define MIN_FRONTS       16          // en dessous : bruit, trame ignoree
 
-CC1101 radio = new Module(PIN_CSN, PIN_GDO0, RADIOLIB_NC, RADIOLIB_NC, SPI);
+// Pilote CC1101 de RadioLib, adapte : on rend accessible l'ecriture/lecture de registre
+// (fonctions "protected" dans RadioLib) pour le test de raccordement A03
+class CC1101Flipper : public CC1101
+{
+public:
+  CC1101Flipper(Module* m) : CC1101(m) {}
+  using CC1101::SPIsetRegValue;
+};
+
+CC1101Flipper radio(new Module(PIN_CSN, PIN_GDO0, RADIOLIB_NC, RADIOLIB_NC, SPI));
 
 enum Mode { ATTENTE, RAW, PAQUETS };
 Mode mode = ATTENTE;
@@ -61,6 +70,10 @@ uint32_t numeroTrame = 0;
 
 // ----- PAQUETS : drapeau leve par l'interruption -----
 volatile bool paquetRecu = false;
+
+// ----- Interruptions actives (pour ne detacher que ce qui est attache) -----
+bool interruptionGDO0 = false;
+bool interruptionPaquet = false;
 
 // ============================================================
 //                      Outils
@@ -85,10 +98,23 @@ int configurerBase(uint32_t bandeRxHz)
   return radio.setPromiscuousMode(false);
 }
 
+void attacherGDO0(void (*fonction)(void))
+{
+  attachInterrupt(digitalPinToInterrupt(PIN_GDO0), fonction, CHANGE);
+  interruptionGDO0 = true;
+}
+
+void detacherGDO0()
+{
+  if (interruptionGDO0) detachInterrupt(digitalPinToInterrupt(PIN_GDO0));
+  interruptionGDO0 = false;
+}
+
 void arreter()
 {
-  detachInterrupt(digitalPinToInterrupt(PIN_GDO0));
-  radio.clearGdo0Action();
+  detacherGDO0();
+  if (interruptionPaquet) radio.clearGdo0Action();
+  interruptionPaquet = false;
   enregistrement = false;
   radio.standby();
   mode = ATTENTE;
@@ -110,12 +136,61 @@ void aide()
 //            A03 - Verification du raccordement
 // ============================================================
 volatile uint32_t compteurFrontsTest = 0;
-void IRAM_ATTR compterFront() { compteurFrontsTest++; }
+void IRAM_ATTR compterFront() { compteurFrontsTest = compteurFrontsTest + 1; }
+
+// Diagnostic sans RadioLib : on parle directement a la puce pour savoir quel fil pose probleme
+void diagnosticBrut()
+{
+  Serial.println("# --- Diagnostic brut ---");
+
+  // a) CHIP_RDYn : quand CSN passe a 0, le CC1101 met MISO a 0 des qu'il est pret
+  SPI.end();
+  pinMode(PIN_CSN, OUTPUT);
+  pinMode(PIN_MISO, INPUT_PULLUP);
+  digitalWrite(PIN_CSN, HIGH);
+  delay(1);
+  int misoRepos = digitalRead(PIN_MISO);
+  digitalWrite(PIN_CSN, LOW);
+  delay(1);
+  int misoSelection = digitalRead(PIN_MISO);
+  digitalWrite(PIN_CSN, HIGH);
+  Serial.printf("# a) MISO avec CSN=1 : %d   MISO avec CSN=0 : %d\n", misoRepos, misoSelection);
+  if (misoSelection == 0)
+    Serial.println("#    -> la puce repond sur MISO : alimentation, CSN et MISO OK");
+  else
+    Serial.println("#    -> MISO reste a 1 : puce non alimentee (VCC/GND), fil CSN ou fil MISO");
+
+  // b) Lecture brute des registres PARTNUM (0xF0) et VERSION (0xF1)
+  SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CSN);
+  pinMode(PIN_CSN, OUTPUT);
+  SPISettings reglages(1000000, MSBFIRST, SPI_MODE0);
+  uint8_t valeurs[2];
+  for (int i = 0; i < 2; i++)
+  {
+    SPI.beginTransaction(reglages);
+    digitalWrite(PIN_CSN, LOW);
+    delayMicroseconds(50);
+    SPI.transfer(0xF0 + i);
+    valeurs[i] = SPI.transfer(0x00);
+    digitalWrite(PIN_CSN, HIGH);
+    SPI.endTransaction();
+  }
+  Serial.printf("# b) PARTNUM lu : 0x%02X (attendu 0x00)   VERSION lu : 0x%02X (attendu 0x14)\n", valeurs[0], valeurs[1]);
+  if (valeurs[1] == 0xFF)
+    Serial.println("#    -> 0xFF : MISO toujours a 1 -> fil MISO, CSN, ou puce non alimentee");
+  else if (valeurs[1] == 0x00)
+    Serial.println("#    -> 0x00 : MISO toujours a 0 -> fil SCK ou MOSI (la puce ne recoit pas l'adresse)");
+  else if (valeurs[1] == 0x14 || valeurs[1] == 0x04 || valeurs[1] == 0x17 || valeurs[1] == 0x03)
+    Serial.println("#    -> puce reconnue en brut : le probleme vient de la config RadioLib, envoie-moi ce log");
+  else
+    Serial.println("#    -> valeur bizarre : faux contact ou fils trop longs, verifier le cablage");
+}
 
 void testRaccordement()
 {
   arreter();
   Serial.println("\n# ===== A03 : test du raccordement =====");
+  Serial.printf("# Broches : SCK=G%d MISO=G%d MOSI=G%d CSN=G%d GDO0=G%d\n", PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CSN, PIN_GDO0);
   bool toutOk = true;
 
   // 1) SPI : le pilote lit le registre VERSION et configure la puce
@@ -123,7 +198,8 @@ void testRaccordement()
   afficherCode("1. begin (SPI + config)", code);
   if (code == RADIOLIB_ERR_CHIP_NOT_FOUND)
   {
-    Serial.println("#    -> puce introuvable : verifier SCK, MISO, MOSI, CSN, VCC 3,3 V, GND");
+    Serial.println("#    -> puce introuvable, diagnostic :");
+    diagnosticBrut();
     return;
   }
   if (code != RADIOLIB_ERR_NONE) return;
@@ -150,9 +226,9 @@ void testRaccordement()
   radio.setOOK(true);
   radio.receiveDirect();
   compteurFrontsTest = 0;
-  attachInterrupt(digitalPinToInterrupt(PIN_GDO0), compterFront, CHANGE);
+  attacherGDO0(compterFront);
   delay(500);
-  detachInterrupt(digitalPinToInterrupt(PIN_GDO0));
+  detacherGDO0();
   Serial.printf("# 4. fronts sur GDO0     : %lu en 500 ms ", (unsigned long)compteurFrontsTest);
   if (compteurFrontsTest > 0) Serial.println("-> fil GDO0 OK");
   else { Serial.println("-> aucun : verifier le fil GDO0"); toutOk = false; }
@@ -238,8 +314,12 @@ void IRAM_ATTR surFrontGDO0()
   dernierFrontUs = maintenant;
   if (digitalRead(PIN_GDO0) == HIGH) duree = -duree;   // on vient de passer a 1 : l'impulsion finie etait basse
 
-  if (nbFronts < MAX_FRONTS) fronts[nbFronts++] = duree;
-  else nbDebordements++;
+  if (nbFronts < MAX_FRONTS)
+  {
+    fronts[nbFronts] = duree;
+    nbFronts = nbFronts + 1;
+  }
+  else nbDebordements = nbDebordements + 1;
 }
 
 void demarrerRAW()
@@ -254,7 +334,7 @@ void demarrerRAW()
   nbFronts = 0;
   nbDebordements = 0;
   enregistrement = false;
-  attachInterrupt(digitalPinToInterrupt(PIN_GDO0), surFrontGDO0, CHANGE);
+  attacherGDO0(surFrontGDO0);
   mode = RAW;
   Serial.println("RAW;num;t_us;rssi_max_dbm;nb_fronts;debordements;durees_us(+haut/-bas)");
 }
@@ -322,6 +402,7 @@ void demarrerPaquets()
   if (code == RADIOLIB_ERR_NONE)
   {
     radio.setGdo0Action(surPaquet, RISING);
+    interruptionPaquet = true;
     paquetRecu = false;
     code = radio.startReceive();
   }
