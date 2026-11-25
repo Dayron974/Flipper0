@@ -11,6 +11,7 @@
 #include <SPI.h>
 #include <RadioLib.h>
 #include "esp_timer.h"
+#include "ihm.h"
 
 // ===================== Broches Tab5 =====================
 #define PIN_SCK    5    // M5-Bus broche 11 <- SCK du CC1101
@@ -443,6 +444,7 @@ void setup()
 {
   Serial.begin(115200);
   delay(2000);
+  initIHM();
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CSN);
   pinMode(PIN_GDO0, INPUT);
   aide();
@@ -463,4 +465,6 @@ void loop()
 
   if (mode == RAW) gererRAW();
   else if (mode == PAQUETS) gererPaquets();
+
+  updateIHM();
 }
