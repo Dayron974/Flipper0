@@ -1,94 +1,95 @@
-// Flipper0 - partie Apprenti A (CC1101 433 MHz sur M5Stack Tab5)
-//   A03 : verification du raccordement + pilote CC1101 (RadioLib 8.0.0) adapte a la Tab5
-//   A04 : scan RSSI 433,05-434,79 MHz avec 3 profils de reglage, mesures repetees
-//   A05 : capture RAW (impulsions OOK) et paquets FSK, horodates, sortie CSV
-//
-// Commandes dans le moniteur serie (115200 bauds) :
-//   t = test raccordement    s = scan RSSI    r = capture RAW
-//   p = capture paquets      x = stop         h = aide
+// =====================================================================
+//  Flipper0 - Partie A (CC1101 433 MHz sur M5Stack Tab5)
+//    A03 : test du raccordement            -> commande t
+//    A04 : scan RSSI, 3 reglages compares  -> commande s
+//    A04 : recherche de frequence en direct -> commande f
+//    A05 : capture RAW horodatee           -> commande r
+//    A05 : capture paquets FSK horodatee   -> commande p
+//    B03 : tests du decodeur sans radio    -> commande d
+//  Pendant une capture ou un scan : x = stop
+// =====================================================================
 
 #include <Arduino.h>
+#include <M5Unified.h>
 #include <SPI.h>
 #include <RadioLib.h>
 #include "esp_timer.h"
+#include "decoder.h"
 
-// ===================== Broches Tab5 =====================
-#define PIN_SCK    5    // M5-Bus broche 11 <- SCK du CC1101
-#define PIN_MISO   19   // M5-Bus broche 9  <- MISO (GDO1) du CC1101
-#define PIN_MOSI   18   // M5-Bus broche 7  <- MOSI du CC1101
-#define PIN_CSN    2    // M5-Bus broche 21 <- CSN du CC1101
-#define PIN_GDO0   3    // M5-Bus broche 19 <- GDO0 du CC1101
-// GDO2 du CC1101 : non utilise (laisser en l'air)
-// VCC du CC1101 : 3,3 V UNIQUEMENT (M5-Bus broche 12) - GND : M5-Bus broche 1
+// ----------------------- Cablage (M-BUS de la Tab5) -----------------------
+#define PIN_SCK    5     // broche 11
+#define PIN_MISO   19    // broche 9
+#define PIN_MOSI   18    // broche 7
+#define PIN_CSN    2     // broche 21
+#define PIN_GDO0   3     // broche 19
+// VCC -> 3V3 (broche 12)   GND -> GND (broche 1)   GDO2 non branche
 
-// ===================== Reglages radio =====================
-#define FREQ_CENTRE_HZ   433920000UL
-#define DEBIT_BPS        4800
-#define DEVIATION_HZ     5000
-#define BANDE_RX_HZ      203000      // RAW : large pour la derive des telecommandes
-#define PUISSANCE_DBM    10
+// ----------------------- Reglages radio -----------------------
+#define FREQUENCE_HZ   433920000UL   // frequence par defaut (telecommandes classiques)
+#define DEBIT_BPS      4800          // debit des paquets FSK
+#define DEVIATION_HZ   5000          // ecart de frequence FSK entre 0 et 1
+#define BANDE_RAW_HZ   203000        // large : tolere la derive des telecommandes
+#define BANDE_PKT_HZ   135000
+#define PUISSANCE_DBM  10
 
-// ===================== Reglages scan (A04) =====================
-#define SCAN_DEBUT_HZ    433050000UL
-#define SCAN_FIN_HZ      434790000UL
-#define SCAN_PAS_HZ      25000UL
-#define SCAN_ECHANTILLONS 8          // lectures RSSI par frequence
-#define SCAN_PASSES      5           // balayages repetes par profil
-const uint32_t PROFILS_BW[] = { 58000, 135000, 325000 };
-const uint8_t NB_PROFILS = 3;
+// ----------------------- Reglages scan (A04) -----------------------
+#define SCAN_DEBUT_HZ  433050000UL
+#define SCAN_FIN_HZ    434790000UL
+#define SCAN_PAS_HZ    25000UL
+#define SCAN_LECTURES  8             // lectures RSSI par frequence
+#define SCAN_PASSES    5             // balayages repetes par reglage
+const uint32_t BANDES_SCAN[3] = { 58000, 135000, 325000 };
 
-// ===================== Reglages capture RAW (A05) =====================
-#define SEUIL_RSSI_DBM   -80.0       // au-dessus : un signal est present
-#define FIN_TRAME_MS     10          // signal absent depuis 10 ms : fin de trame
-#define MAX_FRONTS       2048
-#define MIN_FRONTS       16          // en dessous : bruit, trame ignoree
+// ----------------------- Recherche de frequence (f) -----------------------
+#define RECH_DEBUT_HZ  430000000UL   // plus large que la bande legale : on cherche ou emet l'appareil
+#define RECH_FIN_HZ    440000000UL
+#define RECH_PAS_HZ    50000UL       // 201 frequences -> environ 2 balayages par seconde
+#define RECH_BANDE_HZ  58000         // bande etroite : meilleure precision en frequence
+#define RECH_MARGE_DB  20            // un signal doit depasser le bruit de 20 dB pour etre retenu
 
-// Pilote CC1101 de RadioLib, adapte : on rend accessible l'ecriture/lecture de registre
-// (fonctions "protected" dans RadioLib) pour le test de raccordement A03
+// ----------------------- Reglages capture RAW (A05) -----------------------
+#define MARGE_SEUIL_DB 10            // seuil = bruit mesure + 10 dB
+#define FIN_TRAME_MS   30            // 30 ms sans signal = fin de trame (> synchro EV1527 ~11 ms)
+#define MAX_FRONTS     2048          // taille du buffer
+#define MARGE_FRONTS   64            // on envoie la trame avant que le buffer deborde
+#define MIN_FRONTS     16            // moins d'impulsions = bruit
+
+// ----------------------- Capture paquets (A05) -----------------------
+#define LONGUEUR_MAX   61            // FIFO 64 o - 1 o de longueur - 2 o d'etat : au-dela = faux paquet
+
+// Frequence utilisee par r et p : 433,92 MHz au demarrage, remplacee par celle trouvee avec f
+uint32_t frequenceCible = FREQUENCE_HZ;
+
+// Pilote CC1101 de RadioLib, adapte : rend accessible l'ecriture de registre
 class CC1101Flipper : public CC1101
 {
 public:
   CC1101Flipper(Module* m) : CC1101(m) {}
   using CC1101::SPIsetRegValue;
 };
-
 CC1101Flipper radio(new Module(PIN_CSN, PIN_GDO0, RADIOLIB_NC, RADIOLIB_NC, SPI));
 
-enum Mode { ATTENTE, RAW, PAQUETS };
-Mode mode = ATTENTE;
-
-// ----- RAW : rempli par l'interruption sur GDO0 -----
-volatile int32_t  fronts[MAX_FRONTS];     // duree signee en us : + = niveau haut, - = niveau bas
-volatile uint16_t nbFronts = 0;
-volatile uint32_t nbDebordements = 0;
-volatile uint32_t dernierFrontUs = 0;
-volatile bool     enregistrement = false;
-int64_t debutTrameUs = 0;
-float   rssiMaxTrame = -130.0;
-uint32_t dernierSignalMs = 0;
-uint32_t numeroTrame = 0;
-
-// ----- PAQUETS : drapeau leve par l'interruption -----
-volatile bool paquetRecu = false;
-
-// ----- Interruptions actives (pour ne detacher que ce qui est attache) -----
-bool interruptionGDO0 = false;
-bool interruptionPaquet = false;
-
-// ============================================================
-//                      Outils
-// ============================================================
+// =====================================================================
+//                              Outils
+// =====================================================================
 int64_t tempsUs() { return esp_timer_get_time(); }
 
-void afficherCode(const char* etape, int code)
+void afficher(const char* etape, int code)
 {
-  Serial.printf("# %-22s : %s (code %d)\n", etape, code == RADIOLIB_ERR_NONE ? "OK" : "ERREUR", code);
+  Serial.printf("# %-24s : %s (code %d)\n", etape, code == RADIOLIB_ERR_NONE ? "OK" : "ERREUR", code);
 }
 
-int configurerBase(uint32_t bandeRxHz)
+// x tape dans le moniteur = arreter la mesure en cours
+bool stopDemande()
+{
+  return Serial.available() && Serial.read() == 'x';
+}
+
+// Demarre le CC1101 avec nos reglages
+int demarrerRadio(uint32_t bandeRxHz)
 {
   ConfigFSK_t cfg;
-  cfg.frequency = FREQ_CENTRE_HZ;
+  cfg.frequency = frequenceCible;
   cfg.bitRate = DEBIT_BPS;
   cfg.frequencyDeviation = DEVIATION_HZ;
   cfg.receiverBandwidth = bandeRxHz;
@@ -98,351 +99,391 @@ int configurerBase(uint32_t bandeRxHz)
   return radio.setPromiscuousMode(false);
 }
 
-void attacherGDO0(void (*fonction)(void))
+// Passe en reception OOK brute : GDO0 recopie le signal demodule
+// L'AGC est regle pour l'OOK (valeurs du preset AM650 du Flipper Zero)
+int passerEnOOK()
 {
-  attachInterrupt(digitalPinToInterrupt(PIN_GDO0), fonction, CHANGE);
-  interruptionGDO0 = true;
+  int code = radio.setOOK(true);
+  if (code == RADIOLIB_ERR_NONE) code = radio.SPIsetRegValue(RADIOLIB_CC1101_REG_AGCCTRL2, 0x07);
+  if (code == RADIOLIB_ERR_NONE) code = radio.SPIsetRegValue(RADIOLIB_CC1101_REG_AGCCTRL1, 0x00);
+  if (code == RADIOLIB_ERR_NONE) code = radio.SPIsetRegValue(RADIOLIB_CC1101_REG_AGCCTRL0, 0x91);
+  if (code == RADIOLIB_ERR_NONE) code = radio.SPIsetRegValue(RADIOLIB_CC1101_REG_FREND1, 0xB6);
+  if (code == RADIOLIB_ERR_NONE) code = radio.receiveDirectAsync();
+  return code;
 }
 
-void detacherGDO0()
+// Moyenne de plusieurs lectures RSSI
+float moyenneRSSI(int lectures, int pauseUs)
 {
-  if (interruptionGDO0) detachInterrupt(digitalPinToInterrupt(PIN_GDO0));
-  interruptionGDO0 = false;
-}
-
-void arreter()
-{
-  detacherGDO0();
-  if (interruptionPaquet) radio.clearGdo0Action();
-  interruptionPaquet = false;
-  enregistrement = false;
-  radio.standby();
-  mode = ATTENTE;
-}
-
-void aide()
-{
-  Serial.println();
-  Serial.println("# ===== Flipper0 - CC1101 433 MHz =====");
-  Serial.println("# t : test du raccordement (A03)");
-  Serial.println("# s : scan RSSI 433 MHz, 3 profils x 5 passes (A04)");
-  Serial.println("# r : capture RAW horodatee (A05)");
-  Serial.println("# p : capture paquets FSK horodatee (A05)");
-  Serial.println("# x : stop");
-  Serial.println("# h : cette aide");
-}
-
-// ============================================================
-//            A03 - Verification du raccordement
-// ============================================================
-volatile uint32_t compteurFrontsTest = 0;
-void IRAM_ATTR compterFront() { compteurFrontsTest = compteurFrontsTest + 1; }
-
-// Diagnostic sans RadioLib : on parle directement a la puce pour savoir quel fil pose probleme
-void diagnosticBrut()
-{
-  Serial.println("# --- Diagnostic brut ---");
-
-  // a) CHIP_RDYn : quand CSN passe a 0, le CC1101 met MISO a 0 des qu'il est pret
-  SPI.end();
-  pinMode(PIN_CSN, OUTPUT);
-  pinMode(PIN_MISO, INPUT_PULLUP);
-  digitalWrite(PIN_CSN, HIGH);
-  delay(1);
-  int misoRepos = digitalRead(PIN_MISO);
-  digitalWrite(PIN_CSN, LOW);
-  delay(1);
-  int misoSelection = digitalRead(PIN_MISO);
-  digitalWrite(PIN_CSN, HIGH);
-  Serial.printf("# a) MISO avec CSN=1 : %d   MISO avec CSN=0 : %d\n", misoRepos, misoSelection);
-  if (misoSelection == 0)
-    Serial.println("#    -> la puce repond sur MISO : alimentation, CSN et MISO OK");
-  else
-    Serial.println("#    -> MISO reste a 1 : puce non alimentee (VCC/GND), fil CSN ou fil MISO");
-
-  // b) Lecture brute des registres PARTNUM (0xF0) et VERSION (0xF1)
-  SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CSN);
-  pinMode(PIN_CSN, OUTPUT);
-  SPISettings reglages(1000000, MSBFIRST, SPI_MODE0);
-  uint8_t valeurs[2];
-  for (int i = 0; i < 2; i++)
+  float somme = 0;
+  for (int i = 0; i < lectures; i++)
   {
-    SPI.beginTransaction(reglages);
-    digitalWrite(PIN_CSN, LOW);
-    delayMicroseconds(50);
-    SPI.transfer(0xF0 + i);
-    valeurs[i] = SPI.transfer(0x00);
-    digitalWrite(PIN_CSN, HIGH);
-    SPI.endTransaction();
+    somme += radio.getRSSI();
+    delayMicroseconds(pauseUs);
   }
-  Serial.printf("# b) PARTNUM lu : 0x%02X (attendu 0x00)   VERSION lu : 0x%02X (attendu 0x14)\n", valeurs[0], valeurs[1]);
-  if (valeurs[1] == 0xFF)
-    Serial.println("#    -> 0xFF : MISO toujours a 1 -> fil MISO, CSN, ou puce non alimentee");
-  else if (valeurs[1] == 0x00)
-    Serial.println("#    -> 0x00 : MISO toujours a 0 -> fil SCK ou MOSI (la puce ne recoit pas l'adresse)");
-  else if (valeurs[1] == 0x14 || valeurs[1] == 0x04 || valeurs[1] == 0x17 || valeurs[1] == 0x03)
-    Serial.println("#    -> puce reconnue en brut : le probleme vient de la config RadioLib, envoie-moi ce log");
-  else
-    Serial.println("#    -> valeur bizarre : faux contact ou fils trop longs, verifier le cablage");
+  return somme / lectures;
 }
+
+// =====================================================================
+//                    A03 - Test du raccordement
+// =====================================================================
+volatile uint32_t nbFrontsTest = 0;
+void IRAM_ATTR compterFront() { nbFrontsTest = nbFrontsTest + 1; }
 
 void testRaccordement()
 {
-  arreter();
   Serial.println("\n# ===== A03 : test du raccordement =====");
-  Serial.printf("# Broches : SCK=G%d MISO=G%d MOSI=G%d CSN=G%d GDO0=G%d\n", PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CSN, PIN_GDO0);
-  bool toutOk = true;
 
-  // 1) SPI : le pilote lit le registre VERSION et configure la puce
-  int code = configurerBase(BANDE_RX_HZ);
-  afficherCode("1. begin (SPI + config)", code);
-  if (code == RADIOLIB_ERR_CHIP_NOT_FOUND)
+  // 1) Le pilote lit le registre VERSION et configure la puce
+  int code = demarrerRadio(BANDE_RAW_HZ);
+  afficher("1. puce detectee", code);
+  if (code != RADIOLIB_ERR_NONE)
   {
-    Serial.println("#    -> puce introuvable, diagnostic :");
-    diagnosticBrut();
+    Serial.println("#    -> verifier VCC 3,3 V, GND, SCK, MISO, MOSI, CSN");
     return;
   }
-  if (code != RADIOLIB_ERR_NONE) return;
+  Serial.printf("# 2. registre VERSION      : 0x%02X (0x14 = CC1101 officiel)\n", radio.getChipVersion());
 
-  // 2) Version de la puce
-  int version = radio.getChipVersion();
-  Serial.printf("# 2. registre VERSION    : 0x%02X ", version);
-  if (version == RADIOLIB_CC1101_VERSION_CURRENT) Serial.println("(CC1101 officiel)");
-  else if (version == RADIOLIB_CC1101_VERSION_LEGACY) Serial.println("(CC1101 ancienne revision)");
-  else Serial.println("(clone compatible)");
-
-  // 3) Ecriture + relecture : SPIsetRegValue relit le registre et compare
+  // 3) Ecriture puis relecture d'un registre : teste le fil MOSI
   int c1 = radio.SPIsetRegValue(RADIOLIB_CC1101_REG_SYNC1, 0x55);
   int c2 = radio.SPIsetRegValue(RADIOLIB_CC1101_REG_SYNC1, 0xAA);
-  afficherCode("3. ecriture/relecture", (c1 != RADIOLIB_ERR_NONE) ? c1 : c2);
-  if (c1 != RADIOLIB_ERR_NONE || c2 != RADIOLIB_ERR_NONE)
-  {
-    Serial.println("#    -> lecture OK mais ecriture KO : verifier MOSI");
-    toutOk = false;
-  }
-  configurerBase(BANDE_RX_HZ);   // remet le mot de synchro d'origine
+  afficher("3. ecriture/relecture", (c1 != RADIOLIB_ERR_NONE) ? c1 : c2);
 
-  // 4) Fil GDO0 : en mode RAW OOK, GDO0 recopie le bruit -> il doit bouger
-  radio.setOOK(true);
-  radio.receiveDirect();
-  compteurFrontsTest = 0;
-  attacherGDO0(compterFront);
+  // 4) En OOK brut, GDO0 bouge avec le bruit : teste le fil GDO0
+  demarrerRadio(BANDE_RAW_HZ);
+  passerEnOOK();
+  nbFrontsTest = 0;
+  attachInterrupt(digitalPinToInterrupt(PIN_GDO0), compterFront, CHANGE);
   delay(500);
-  detacherGDO0();
-  Serial.printf("# 4. fronts sur GDO0     : %lu en 500 ms ", (unsigned long)compteurFrontsTest);
-  if (compteurFrontsTest > 0) Serial.println("-> fil GDO0 OK");
-  else { Serial.println("-> aucun : verifier le fil GDO0"); toutOk = false; }
+  detachInterrupt(digitalPinToInterrupt(PIN_GDO0));
+  Serial.printf("# 4. fronts sur GDO0       : %lu en 500 ms %s\n", (unsigned long)nbFrontsTest,
+                nbFrontsTest > 0 ? "-> fil GDO0 OK" : "-> aucun : verifier le fil GDO0");
 
-  // 5) RSSI : une valeur entre -120 et -40 dBm sans emetteur proche = chaine RX vivante
-  float rssi = radio.getRSSI();
-  Serial.printf("# 5. RSSI a vide         : %.0f dBm %s\n", rssi,
-                (rssi > -125 && rssi < -40) ? "-> chaine de reception OK" : "-> valeur anormale");
-
+  // 5) RSSI a vide : une valeur normale prouve que la reception fonctionne
+  float rssi = moyenneRSSI(20, 1000);
+  Serial.printf("# 5. RSSI a vide           : %.0f dBm %s\n", rssi,
+                (rssi > -125 && rssi < -40) ? "-> reception OK" : "-> valeur anormale");
   radio.standby();
-  Serial.println(toutOk ? "# RESULTAT A03 : raccordement OK" : "# RESULTAT A03 : probleme, voir ci-dessus");
 }
 
-// ============================================================
-//            A04 - Scan RSSI et comparaison des reglages
-// ============================================================
-float mesurerRSSI(uint32_t freqHz, float* rssiMax)
-{
-  radio.setFrequency(freqHz);
-  radio.receiveDirect();          // relance la reception (calibration auto du synthetiseur)
-  delay(2);                       // temps de calibration + stabilisation de l'AGC
-  float somme = 0;
-  *rssiMax = -130;
-  for (int i = 0; i < SCAN_ECHANTILLONS; i++)
-  {
-    float r = radio.getRSSI();
-    somme += r;
-    if (r > *rssiMax) *rssiMax = r;
-    delayMicroseconds(250);
-  }
-  return somme / SCAN_ECHANTILLONS;
-}
-
+// =====================================================================
+//              A04 - Scan RSSI et comparaison des reglages
+// =====================================================================
 void scanRSSI()
 {
-  arreter();
   Serial.println("\n# ===== A04 : scan RSSI 433,05 - 434,79 MHz =====");
-  Serial.println("SCAN;profil;bande_rx_hz;passe;freq_hz;rssi_moy_dbm;rssi_max_dbm");
+  Serial.println("SCAN;reglage;bande_rx_hz;passe;freq_hz;rssi_moy_dbm;rssi_max_dbm");
 
-  for (uint8_t p = 0; p < NB_PROFILS; p++)
+  for (int r = 0; r < 3; r++)
   {
-    int code = configurerBase(PROFILS_BW[p]);
-    if (code != RADIOLIB_ERR_NONE) { afficherCode("configuration profil", code); return; }
+    int code = demarrerRadio(BANDES_SCAN[r]);
+    if (code != RADIOLIB_ERR_NONE) { afficher("demarrage scan", code); return; }
     radio.setOOK(true);
 
-    float plancherTotal = 0, picMax = -130;
-    uint32_t freqPic = 0, nbMesures = 0;
-    int64_t t0 = tempsUs();
+    float somme = 0, pic = -130;
+    uint32_t freqPic = 0, nb = 0;
 
-    for (uint8_t passe = 1; passe <= SCAN_PASSES; passe++)
+    for (int passe = 1; passe <= SCAN_PASSES; passe++)
     {
       for (uint32_t f = SCAN_DEBUT_HZ; f <= SCAN_FIN_HZ; f += SCAN_PAS_HZ)
       {
-        float rMax;
-        float rMoy = mesurerRSSI(f, &rMax);
-        Serial.printf("SCAN;P%u;%lu;%u;%lu;%.1f;%.1f\n", p + 1, (unsigned long)PROFILS_BW[p], passe,
-                      (unsigned long)f, rMoy, rMax);
-        plancherTotal += rMoy;
-        nbMesures++;
-        if (rMax > picMax) { picMax = rMax; freqPic = f; }
-        if (Serial.available() && Serial.peek() == 'x') { arreter(); return; }
+        radio.setFrequency(f);
+        radio.receiveDirectAsync();   // relance la reception sur la nouvelle frequence
+        delay(2);                     // calibration du synthetiseur + stabilisation de l'AGC
+
+        float total = 0, maxi = -130;
+        for (int i = 0; i < SCAN_LECTURES; i++)
+        {
+          float rssi = radio.getRSSI();
+          total += rssi;
+          if (rssi > maxi) maxi = rssi;
+          delayMicroseconds(250);
+        }
+        float moy = total / SCAN_LECTURES;
+
+        Serial.printf("SCAN;P%d;%lu;%d;%lu;%.1f;%.1f\n", r + 1, (unsigned long)BANDES_SCAN[r], passe,
+                      (unsigned long)f, moy, maxi);
+        somme += moy;
+        nb++;
+        if (maxi > pic) { pic = maxi; freqPic = f; }
+        if (stopDemande()) { radio.standby(); Serial.println("# Scan arrete"); return; }
       }
     }
-
-    float dureeBalayage = (tempsUs() - t0) / 1000.0 / SCAN_PASSES;
-    Serial.printf("# Profil P%u (bande RX %lu Hz) : niveau moyen %.1f dBm, pic %.1f dBm a %lu Hz, %.0f ms par balayage\n",
-                  p + 1, (unsigned long)PROFILS_BW[p], plancherTotal / nbMesures, picMax,
-                  (unsigned long)freqPic, dureeBalayage);
+    Serial.printf("# Reglage P%d (bande %lu Hz) : niveau moyen %.1f dBm, pic %.1f dBm a %lu Hz\n",
+                  r + 1, (unsigned long)BANDES_SCAN[r], somme / nb, pic, (unsigned long)freqPic);
   }
   radio.standby();
   Serial.println("# Scan termine");
 }
 
-// ============================================================
-//            A05 - Capture RAW horodatee
-// ============================================================
-void IRAM_ATTR surFrontGDO0()
+// =====================================================================
+//        A04 - Recherche de frequence en direct (commande f)
+//  Garder le bouton de la telecommande appuye : la frequence qui
+//  ressort a chaque balayage est celle de l'emetteur.
+// =====================================================================
+void rechercheFrequence()
+{
+  Serial.println("\n# ===== Recherche de frequence 430 - 440 MHz (x pour arreter) =====");
+  int code = demarrerRadio(RECH_BANDE_HZ);
+  if (code == RADIOLIB_ERR_NONE) code = radio.setOOK(true);
+  afficher("demarrage recherche", code);
+  if (code != RADIOLIB_ERR_NONE) return;
+  Serial.println("# Maintiens le bouton de la telecommande appuye pres de l'antenne");
+
+  float meilleurPic = -130;      // signal le plus fort vu depuis le debut de la recherche
+
+  while (!stopDemande())
+  {
+    // Un balayage : on garde la frequence la plus forte et le niveau moyen (= bruit)
+    float pic = -130, somme = 0;
+    uint32_t freqPic = 0, nb = 0;
+    for (uint32_t f = RECH_DEBUT_HZ; f <= RECH_FIN_HZ; f += RECH_PAS_HZ)
+    {
+      radio.setFrequency(f);
+      radio.receiveDirectAsync();
+      delay(2);
+      float rssi = radio.getRSSI();
+      somme += rssi;
+      nb++;
+      if (rssi > pic) { pic = rssi; freqPic = f; }
+    }
+    float bruit = somme / nb;
+    Serial.printf("# plus fort : %.3f MHz a %.0f dBm (bruit %.0f dBm)", freqPic / 1e6, pic, bruit);
+
+    // Un vrai signal depasse nettement le bruit : on memorise sa frequence
+    if (pic - bruit >= RECH_MARGE_DB && pic > meilleurPic)
+    {
+      meilleurPic = pic;
+      frequenceCible = freqPic;
+      Serial.print("  <- signal retenu");
+    }
+    Serial.println();
+  }
+  radio.standby();
+  Serial.printf("# Recherche arretee. Frequence utilisee par r et p : %.3f MHz\n", frequenceCible / 1e6);
+}
+
+// =====================================================================
+//                     A05 - Capture RAW horodatee
+// =====================================================================
+// L'interruption range la duree de chaque impulsion : + = haut, - = bas
+volatile int32_t  fronts[MAX_FRONTS];
+volatile uint16_t nbFronts = 0;
+volatile uint32_t nbPerdus = 0;       // impulsions perdues si le buffer est plein
+volatile uint32_t dernierFrontUs = 0;
+volatile bool     enregistre = false;
+
+void IRAM_ATTR surFront()
 {
   uint32_t maintenant = micros();
-  if (!enregistrement) { dernierFrontUs = maintenant; return; }
-
   int32_t duree = (int32_t)(maintenant - dernierFrontUs);
   dernierFrontUs = maintenant;
-  if (digitalRead(PIN_GDO0) == HIGH) duree = -duree;   // on vient de passer a 1 : l'impulsion finie etait basse
+  if (!enregistre) return;
 
+  if (digitalRead(PIN_GDO0) == HIGH) duree = -duree;   // on vient de passer a 1 : l'impulsion finie etait basse
   if (nbFronts < MAX_FRONTS)
   {
     fronts[nbFronts] = duree;
     nbFronts = nbFronts + 1;
   }
-  else nbDebordements = nbDebordements + 1;
+  else nbPerdus = nbPerdus + 1;
 }
 
-void demarrerRAW()
-{
-  arreter();
-  int code = configurerBase(BANDE_RX_HZ);
-  if (code == RADIOLIB_ERR_NONE) code = radio.setOOK(true);
-  if (code == RADIOLIB_ERR_NONE) code = radio.receiveDirect();
-  afficherCode("demarrage RAW", code);
-  if (code != RADIOLIB_ERR_NONE) return;
-
-  nbFronts = 0;
-  nbDebordements = 0;
-  enregistrement = false;
-  attacherGDO0(surFrontGDO0);
-  mode = RAW;
-  Serial.println("RAW;num;t_us;rssi_max_dbm;nb_fronts;debordements;durees_us(+haut/-bas)");
-}
-
-void envoyerTrameRAW()
+// Copie le buffer, affiche la trame RAW, puis la donne au decodeur B03
+void envoyerTrame(uint32_t numero, int64_t debutUs, float rssiMax)
 {
   static int32_t copie[MAX_FRONTS];
   noInterrupts();
+  enregistre = false;
   uint16_t n = nbFronts;
-  uint32_t perdus = nbDebordements;
+  uint32_t perdus = nbPerdus;
   for (uint16_t i = 0; i < n; i++) copie[i] = fronts[i];
   nbFronts = 0;
-  nbDebordements = 0;
+  nbPerdus = 0;
   interrupts();
 
   if (n < MIN_FRONTS) return;
-  numeroTrame++;
-  Serial.printf("RAW;%lu;%lld;%.0f;%u;%lu;", (unsigned long)numeroTrame, (long long)debutTrameUs, rssiMaxTrame, n,
+
+  Serial.printf("RAW;%lu;%lld;%.0f;%u;%lu;", (unsigned long)numero, (long long)debutUs, rssiMax, n,
                 (unsigned long)perdus);
   for (uint16_t i = 0; i < n; i++) Serial.printf("%ld ", (long)copie[i]);
   Serial.println();
+
+  analyserRAW(copie, n, perdus, numero);
 }
 
-void gererRAW()
+void captureRAW()
 {
-  static uint32_t derniereLecture = 0;
-  if (millis() - derniereLecture < 1) return;
-  derniereLecture = millis();
+  Serial.println("\n# ===== A05 : capture RAW (x pour arreter) =====");
+  Serial.printf("# Frequence : %.3f MHz (tape f pour chercher celle de ta telecommande)\n", frequenceCible / 1e6);
+  int code = demarrerRadio(BANDE_RAW_HZ);
+  if (code == RADIOLIB_ERR_NONE) code = passerEnOOK();
+  afficher("reception OOK", code);
+  if (code != RADIOLIB_ERR_NONE) return;
 
-  float rssi = radio.getRSSI();
+  // Le seuil s'adapte au bruit ambiant
+  delay(50);
+  float bruit = moyenneRSSI(100, 2000);
+  float seuil = bruit + MARGE_SEUIL_DB;
+  Serial.printf("# Bruit mesure : %.0f dBm -> seuil de declenchement : %.0f dBm\n", bruit, seuil);
+  Serial.println("RAW;num;t_us;rssi_max_dbm;nb_fronts;perdus;durees_us(+haut/-bas)");
 
-  if (rssi >= SEUIL_RSSI_DBM)
+  nbFronts = 0;
+  nbPerdus = 0;
+  enregistre = false;
+  attachInterrupt(digitalPinToInterrupt(PIN_GDO0), surFront, CHANGE);
+
+  uint32_t numero = 0;
+  bool trameEnCours = false;
+  int64_t debutUs = 0;
+  float rssiMax = -130;
+  uint32_t dernierSignalMs = 0;
+  uint32_t dernierAffichageMs = 0;
+
+  while (!stopDemande())
   {
-    if (!enregistrement)
+    float rssi = radio.getRSSI();
+
+    // Signal present : on demarre (ou on continue) l'enregistrement
+    if (rssi >= seuil)
     {
-      noInterrupts();
-      nbFronts = 0;
-      nbDebordements = 0;
-      dernierFrontUs = micros();
-      enregistrement = true;
-      interrupts();
-      debutTrameUs = tempsUs();
-      rssiMaxTrame = rssi;
+      if (!trameEnCours)
+      {
+        noInterrupts();
+        nbFronts = 0;
+        nbPerdus = 0;
+        dernierFrontUs = micros();
+        enregistre = true;
+        interrupts();
+        trameEnCours = true;
+        debutUs = tempsUs();
+        rssiMax = rssi;
+      }
+      if (rssi > rssiMax) rssiMax = rssi;
+      dernierSignalMs = millis();
     }
-    if (rssi > rssiMaxTrame) rssiMaxTrame = rssi;
-    dernierSignalMs = millis();
+
+    // Fin de trame : silence assez long, ou buffer presque plein
+    bool silence = trameEnCours && (millis() - dernierSignalMs > FIN_TRAME_MS);
+    bool plein = trameEnCours && (nbFronts >= MAX_FRONTS - MARGE_FRONTS);
+    if (silence || plein)
+    {
+      numero++;
+      envoyerTrame(numero, debutUs, rssiMax);
+      trameEnCours = false;
+    }
+
+    // Toutes les secondes sans trame : on montre qu'on ecoute
+    if (!trameEnCours && millis() - dernierAffichageMs >= 1000)
+    {
+      Serial.printf("# ecoute... RSSI = %.0f dBm (seuil %.0f dBm)\n", rssi, seuil);
+      dernierAffichageMs = millis();
+    }
+    delay(1);
   }
-  else if (enregistrement && millis() - dernierSignalMs > FIN_TRAME_MS)
-  {
-    enregistrement = false;
-    envoyerTrameRAW();
-  }
+
+  detachInterrupt(digitalPinToInterrupt(PIN_GDO0));
+  enregistre = false;
+  radio.standby();
+  Serial.println("# Capture RAW arretee");
 }
 
-// ============================================================
-//            A05 - Capture paquets FSK horodatee
-// ============================================================
+// =====================================================================
+//                  A05 - Capture paquets FSK horodatee
+// =====================================================================
+volatile bool paquetRecu = false;
 void IRAM_ATTR surPaquet() { paquetRecu = true; }
 
-void demarrerPaquets()
+void capturePaquets()
 {
-  arreter();
-  int code = configurerBase(135000);
+  Serial.println("\n# ===== A05 : capture paquets FSK (x pour arreter) =====");
+  Serial.printf("# Frequence : %.3f MHz\n", frequenceCible / 1e6);
+  int code = demarrerRadio(BANDE_PKT_HZ);
   if (code == RADIOLIB_ERR_NONE) code = radio.packetMode();
   if (code == RADIOLIB_ERR_NONE)
   {
     radio.setGdo0Action(surPaquet, RISING);
-    interruptionPaquet = true;
     paquetRecu = false;
     code = radio.startReceive();
   }
-  afficherCode("demarrage paquets", code);
+  afficher("reception paquets", code);
   if (code != RADIOLIB_ERR_NONE) return;
-  mode = PAQUETS;
   Serial.println("PKT;num;t_us;rssi_dbm;lqi;longueur;crc_ok;donnees_hex");
-}
 
-void gererPaquets()
-{
-  if (!paquetRecu) return;
-  paquetRecu = false;
-  int64_t t = tempsUs();
+  uint32_t numero = 0;
+  uint32_t fauxPaquets = 0;
+  uint32_t dernierAffichageMs = 0;
 
-  uint8_t donnees[64];
-  size_t longueur = radio.getPacketLength();
-  if (longueur > sizeof(donnees)) longueur = sizeof(donnees);
-  int code = radio.readData(donnees, longueur);
-
-  if (code == RADIOLIB_ERR_NONE || code == RADIOLIB_ERR_CRC_MISMATCH)
+  while (!stopDemande())
   {
-    numeroTrame++;
-    Serial.printf("PKT;%lu;%lld;%.1f;%u;%u;%d;", (unsigned long)numeroTrame, (long long)t, radio.getRSSI(),
-                  radio.getLQI(), (unsigned)longueur, code == RADIOLIB_ERR_NONE ? 1 : 0);
-    for (size_t i = 0; i < longueur; i++) Serial.printf("%02X", donnees[i]);
-    Serial.println();
-  }
-  else afficherCode("lecture paquet", code);
+    if (paquetRecu)
+    {
+      paquetRecu = false;
+      int64_t t = tempsUs();
 
-  radio.startReceive();
+      // Longueur impossible = le "paquet" vient du bruit : on le jette
+      size_t longueur = radio.getPacketLength();
+      if (longueur == 0 || longueur > LONGUEUR_MAX)
+      {
+        fauxPaquets++;
+        radio.startReceive();
+        continue;
+      }
+
+      uint8_t donnees[LONGUEUR_MAX];
+      bool tronque = false;
+      code = radio.readData(donnees, longueur);
+      bool crcOk = (code == RADIOLIB_ERR_NONE);
+
+      if (crcOk || code == RADIOLIB_ERR_CRC_MISMATCH)
+      {
+        numero++;
+        Serial.printf("PKT;%lu;%lld;%.1f;%u;%u;%d;", (unsigned long)numero, (long long)t, radio.getRSSI(),
+                      radio.getLQI(), (unsigned)longueur, crcOk ? 1 : 0);
+        for (size_t i = 0; i < longueur; i++) Serial.printf("%02X", donnees[i]);
+        Serial.println();
+        analyserFSK(donnees, longueur, crcOk, tronque, numero);
+      }
+      else afficher("lecture paquet", code);
+
+      radio.startReceive();
+    }
+
+    if (millis() - dernierAffichageMs >= 1000)
+    {
+      Serial.printf("# ecoute des paquets FSK... (%lu faux paquets ignores)\n", (unsigned long)fauxPaquets);
+      dernierAffichageMs = millis();
+    }
+    delay(1);
+  }
+
+  radio.clearGdo0Action();
+  radio.standby();
+  Serial.println("# Capture paquets arretee");
 }
 
-// ============================================================
-//                      setup / loop
-// ============================================================
+// =====================================================================
+//                          setup / loop
+// =====================================================================
+void aide()
+{
+  Serial.println("\n# ===== Flipper0 - CC1101 433 MHz =====");
+  Serial.println("# t : test du raccordement (A03)");
+  Serial.println("# s : scan RSSI (A04)");
+  Serial.println("# f : recherche de la frequence d'une telecommande (A04)");
+  Serial.println("# r : capture RAW (A05)");
+  Serial.println("# p : capture paquets FSK (A05)");
+  Serial.println("# d : tests du decodeur sans radio (B03)");
+  Serial.println("# x : arreter une mesure en cours");
+}
+
 void setup()
 {
-  Serial.begin(115200);
-  delay(2000);
+  auto cfg = M5.config();
+  cfg.serial_baudrate = 115200;
+  M5.begin(cfg);                  // demarre la Tab5 et le port serie
+  M5.Power.setExtOutput(true);    // alimente les ports d'extension
+  delay(2000);                    // laisse le CC1101 demarrer
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CSN);
   pinMode(PIN_GDO0, INPUT);
   aide();
@@ -450,17 +491,13 @@ void setup()
 
 void loop()
 {
-  if (Serial.available())
-  {
-    char c = Serial.read();
-    if (c == 't') testRaccordement();
-    else if (c == 's') scanRSSI();
-    else if (c == 'r') demarrerRAW();
-    else if (c == 'p') demarrerPaquets();
-    else if (c == 'x') { arreter(); Serial.println("# Stop"); }
-    else if (c == 'h') aide();
-  }
-
-  if (mode == RAW) gererRAW();
-  else if (mode == PAQUETS) gererPaquets();
+  if (!Serial.available()) return;
+  char c = Serial.read();
+  if (c == 't') testRaccordement();
+  else if (c == 's') scanRSSI();
+  else if (c == 'f') rechercheFrequence();
+  else if (c == 'r') captureRAW();
+  else if (c == 'p') capturePaquets();
+  else if (c == 'd') testDecodeur();
+  else if (c == 'h') aide();
 }
