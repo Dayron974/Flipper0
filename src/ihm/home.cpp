@@ -25,6 +25,8 @@ struct Button {
 
     const char* title;
     const char* subtitle;
+    
+    Screen target;
 
     bool contains(int tx, int ty) const {
         return tx >= x && tx < x + w &&
@@ -37,18 +39,27 @@ struct Button {
 // ==================================================
 
 Button buttons[] = {
-    {0, 0, 0, 0, "Frequency Scanner", "RSSI / Frequency"},
-    {0, 0, 0, 0, "Read RAW",          "OOK pulse capture"},
-    {0, 0, 0, 0, "Read FSK",          "Packet receiver"},
-    {0, 0, 0, 0, "Signal Analysis",   "Timing / Decoder"},
-    {0, 0, 0, 0, "Saved Signals",     "microSD storage"},
-    {0, 0, 0, 0, "Settings",          "Radio / Diagnostics"}
+    {0, 0, 0, 0, "Frequency Scanner",
+     "RSSI / Frequency", Screen::SCANNER},
+
+    {0, 0, 0, 0, "Read RAW",
+     "OOK pulse capture", Screen::RAW_VIEWER},
+
+    {0, 0, 0, 0, "Read FSK",
+     "Packet receiver", Screen::FSK_VIEWER},
+
+    {0, 0, 0, 0, "Signal Analysis",
+     "Timing / Decoder", Screen::ANALYZER},
+
+    {0, 0, 0, 0, "Saved Signals",
+     "microSD storage", Screen::SAVED_SIGNALS},
+
+    {0, 0, 0, 0, "Settings",
+     "Radio / Diagnostics", Screen::SETTINGS}
 };
 
 constexpr int BUTTON_COUNT =
     sizeof(buttons) / sizeof(buttons[0]);
-
-int selectedButton = -1;
 
 // ==================================================
 // Calcul des positions des boutons
@@ -148,7 +159,7 @@ void drawHeader() {
     );
 
     M5.Display.drawString(
-        "UI TEST",
+        "UI",
         M5.Display.width() - 150, 40
     );
 
@@ -177,7 +188,7 @@ void drawFooter() {
     M5.Display.setTextColor(COLOR_MUTED);
 
     M5.Display.drawString(
-        "433 MHz - IHM test mode",
+        "433 MHz - IHM mode",
         40, y + 24
     );
 
@@ -194,17 +205,16 @@ void drawFooter() {
 // Dessin du menu complet
 // ==================================================
 
-void drawMenu() {
+void drawHome() {
+
+    layoutButtons();
 
     M5.Display.fillScreen(COLOR_BG);
 
     drawHeader();
 
     for (int i = 0; i < BUTTON_COUNT; i++) {
-        drawButton(
-            buttons[i],
-            i == selectedButton
-        );
+        drawButton(buttons[i], false);
     }
 
     drawFooter();
@@ -214,67 +224,20 @@ void drawMenu() {
 // Gestion tactile
 // ==================================================
 
-void handleTouch() {
-
-    auto touch = M5.Touch.getDetail();
-
-    if (!touch.wasPressed()) {
-        return;
-    }
+void handleHomeTouch(int x, int y) {
 
     for (int i = 0; i < BUTTON_COUNT; i++) {
 
-        if (buttons[i].contains(touch.x, touch.y)) {
-
-            // Deselection de l'ancien bouton
-            if (selectedButton != -1) {
-                drawButton(
-                    buttons[selectedButton],
-                    false
-                );
-            }
-
-            // Selection du nouveau bouton
-            selectedButton = i;
-
-            drawButton(buttons[i], true);
+        if (buttons[i].contains(x, y)) {
 
             Serial.printf(
-                "Selected: %s\n",
+                "Opening: %s\n",
                 buttons[i].title
             );
 
-            break;
+            showScreen(buttons[i].target);
+
+            return;
         }
     }
-}
-
-// ==================================================
-// Initialisation
-// ==================================================
-void initIHM() {
-
-    auto cfg = M5.config();
-    M5.begin(cfg);
-
-    // Orientation paysage
-    if (M5.Display.height() > M5.Display.width()) {
-        M5.Display.setRotation(3);
-    }
-
-    layoutButtons();
-    drawMenu();
-
-    Serial.println("IHM initialized");
-}
-
-// ==================================================
-// Boucle principale
-// ==================================================
-
-void updateIHM() {
-
-    M5.update();
-
-    handleTouch();
 }
